@@ -11,7 +11,7 @@ public sealed class WhisperTranscriber : ITranscriber
 
     private const string VocabularyPrompt =
         "Aviation radio brevity calls. Flight callsigns: Wizard 1-1, Viper 2-1, " +
-        "Eagle 1-1, Hornet 3-1, Falcon, Magic, Overlord, Darkstar, Warrior 1-1. " +
+        "Eagle 1-1, Hornet 3-1, Falcon, Magic, Overlord, Darkstar, Hammer 1-1. " +
         "AWACS phrases: request picture, bogey dope, declare, vector, posit, " +
         "contact bullseye. " +
         "JTAC / CAS phrases: checking in, ready for tasking, ready for 9-line, " +

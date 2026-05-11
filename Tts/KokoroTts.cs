@@ -39,6 +39,29 @@ public sealed class KokoroTts : ITextToSpeech
             Console.WriteLine($"  {v.Gender,-6} {v.Language,-25} {v.Name}");
     }
 
+    /// English-speaking male voices, suitable for AWACS/JTAC/tower roles.
+    /// Returns voice NAMES (e.g. "am_michael"), sorted for determinism so the
+    /// shuffle below is the only source of randomness.
+    public static IReadOnlyList<string> AvailableMaleEnglishVoiceNames()
+    {
+        return KokoroVoiceManager.Voices
+            .Where(v => v.Gender == KokoroGender.Male)
+            .Where(v => v.Language is KokoroLanguage.AmericanEnglish
+                                   or KokoroLanguage.BritishEnglish)
+            .Select(v => v.Name)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// Returns N distinct voice names randomly drawn from the supplied pool.
+    /// If the pool has fewer than N entries, the result is shorter (we never
+    /// hand out the same voice twice so multiple agents stay distinguishable).
+    public static IReadOnlyList<string> PickDistinctVoices(IReadOnlyList<string> pool, int count, Random? rng = null)
+    {
+        rng ??= new Random();
+        return pool.OrderBy(_ => rng.Next()).Take(count).ToList();
+    }
+
     public Task<byte[]> SynthesizeAsync(string text)
     {
         var tokens = Tokenizer.Tokenize(text.Trim(), _voice.GetLangCode(), preprocess: true);

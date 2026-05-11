@@ -6,4 +6,5 @@ obj/
 ggml-*.bin
 *.onnx
 voices/
+tts-cache/
 /.claude

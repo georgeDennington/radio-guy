@@ -15,8 +15,19 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         Intent.AwacsPicture => Picture(call),
         Intent.AwacsBogeyDope => BogeyDope(call),
         Intent.AwacsDeclare => Declare(call),
+        Intent.Unrecognized => Unrecognized(call),
         _ => $"{call.Caller}, {_shortName}, unable.",
     };
+
+    private string Unrecognized(RadioCall call)
+    {
+        if (call.Caller is null)
+            return $"Unknown station calling {_shortName}, say again your callsign.";
+
+        var options = string.Join(", ", AvailableNext().Select(s => s.Hint));
+        return $"{call.Caller}, {_shortName}, did not copy. " +
+               $"Possible calls: {options}.";
+    }
 
     public IReadOnlyList<NextStep> AvailableNext() => new[]
     {

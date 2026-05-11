@@ -42,13 +42,7 @@ public sealed class RegexIntentParser : IIntentParser
 
         var text = Normalize(rawText);
 
-        Intent? intent = null;
-        foreach (var rule in _rules)
-        {
-            if (rule.Pattern.IsMatch(text)) { intent = rule.Intent; break; }
-        }
-        if (intent is null) return null;
-
+        // Find recipient and caller via the callsign regex.
         string? recipient = null;
         string? caller = null;
 
@@ -57,24 +51,33 @@ public sealed class RegexIntentParser : IIntentParser
             var rawName = m.Groups["name"].Value.ToLowerInvariant();
 
             if (_recipientNames.Contains(rawName))
-            {
-                // Whatever Whisper transcribed, normalize to the primary recipient name.
                 recipient ??= FormatCallsign(m, _primaryRecipientName);
-            }
             else
-            {
-                // Look up the canonical caller name (or null if it was already canonical).
                 caller ??= FormatCallsign(m, Callsigns.Canonical(rawName));
-            }
         }
 
-        if (caller is null) return null;
+        // No mention of our recipient → call isn't for this agent.
+        if (recipient is null) return null;
+
+        // Try to match an intent.
+        Intent? matched = null;
+        foreach (var rule in _rules)
+        {
+            if (rule.Pattern.IsMatch(text)) { matched = rule.Intent; break; }
+        }
+
+        // Decide what we actually managed to understand.
+        // - Caller heard AND intent matched -> the matched intent
+        // - Either is missing -> Unrecognized (cover-all path in the responder)
+        var finalIntent = (caller is not null && matched.HasValue)
+            ? matched.Value
+            : Intent.Unrecognized;
 
         return new RadioCall(
             Caller: caller,
-            Recipient: recipient ?? "(unaddressed)",
-            AddressedToRecipient: recipient is not null,
-            Intent: intent.Value,
+            Recipient: recipient,
+            AddressedToRecipient: true,
+            Intent: finalIntent,
             NormalizedText: text);
     }
 

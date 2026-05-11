@@ -70,8 +70,9 @@ public sealed class JtacResponseGenerator : IResponseGenerator
     private FlowState _state = FlowState.Idle;
     private NineLineBrief? _brief;
     private string _lastResponse = "";
+    private readonly HashSet<int> _confirmedLines = new();
 
-    public JtacResponseGenerator(string callsign = "Warrior 1-1")
+    public JtacResponseGenerator(string callsign = "Hammer 1-1")
     {
         _shortName = callsign.Split(' ', 2)[0];
     }
@@ -109,11 +110,17 @@ public sealed class JtacResponseGenerator : IResponseGenerator
             case FlowState.AwaitingReadback:
             {
                 var b = _brief!;
-                var ex = $"{_shortName}, {caller}, " +
-                         $"elevation {b.Elevation} feet, " +
-                         $"grid {b.GridLetters} {b.GridEasting:D4} {b.GridNorthing:D4}, " +
-                         $"friendlies {b.FriendlyDistance} meters {b.FriendlyDirection}";
-                list.Add(new("readback 4, 6, 8", ex));
+                var pending = new[] { 4, 6, 8 }.Where(l => !_confirmedLines.Contains(l)).ToList();
+
+                var parts = new List<string>();
+                if (pending.Contains(4)) parts.Add($"elevation {b.Elevation} feet");
+                if (pending.Contains(6)) parts.Add($"grid {b.GridLetters} {b.GridEasting:D4} {b.GridNorthing:D4}");
+                if (pending.Contains(8)) parts.Add($"friendlies {b.FriendlyDistance} meters {b.FriendlyDirection}");
+
+                var hint = pending.Count == 1
+                    ? $"readback line {pending[0]}"
+                    : $"readback {string.Join("/", pending)}";
+                list.Add(new(hint, $"{_shortName}, {caller}, {string.Join(", ", parts)}"));
                 break;
             }
 
@@ -145,6 +152,7 @@ public sealed class JtacResponseGenerator : IResponseGenerator
                 if (_state is FlowState.Idle or FlowState.CheckedIn or FlowState.Complete)
                 {
                     _brief = Generate9Line();
+                    _confirmedLines.Clear();
                     _state = FlowState.BriefInProgress1;
                     return $"{call.Caller}, {_shortName}, type 2 in effect. " +
                            $"Line 1, IP {_brief.Ip}. Break. " +
@@ -210,9 +218,22 @@ public sealed class JtacResponseGenerator : IResponseGenerator
                     ? $"{call.Caller}, {_shortName}, no prior transmission to repeat."
                     : _lastResponse;
 
+            case Intent.Unrecognized:
+                return Unrecognized(call);
+
             default:
                 return $"{call.Caller}, {_shortName}, unable.";
         }
+    }
+
+    private string Unrecognized(RadioCall call)
+    {
+        if (call.Caller is null)
+            return $"Unknown station calling {_shortName}, say again your callsign.";
+
+        var options = string.Join(", ", AvailableNext().Select(s => s.Hint));
+        return $"{call.Caller}, {_shortName}, did not copy. " +
+               $"Possible calls: {options}.";
     }
 
     private string VerifyReadback(RadioCall call)
@@ -224,86 +245,86 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         var heardLetters = ExtractAllPhoneticCombinations(text);
         var heardDirections = ExtractAllDirections(text);
 
-        // Diagnostic dump so the user can see what the parser actually grabbed
-        // from Whisper's transcript when verification fails.
         Console.WriteLine($"  readback diag:");
         Console.WriteLine($"    heard numbers   : {Show(heardNumbers.OrderBy(n => n).Take(40))}");
         Console.WriteLine($"    heard letters   : {Show(heardLetters.OrderBy(s => s).Take(20))}");
         Console.WriteLine($"    heard directions: {Show(heardDirections)}");
         Console.WriteLine($"    expected        : elev={b.Elevation}, grid={b.GridLetters} {b.GridEasting:D4}/{b.GridNorthing:D4}, friend={b.FriendlyDistance}m {b.FriendlyDirection}");
+        Console.WriteLine($"    prior confirmed : {Show(_confirmedLines.OrderBy(n => n))}");
 
+        var line4Ok = heardNumbers.Contains(b.Elevation);
+        var line6Ok = heardLetters.Contains(b.GridLetters)
+                   && heardNumbers.Contains(b.GridEasting)
+                   && heardNumbers.Contains(b.GridNorthing);
+        var line8Ok = heardNumbers.Contains(b.FriendlyDistance)
+                   && heardDirections.Contains(b.FriendlyDirection);
+
+        var newlyConfirmed = new List<int>();
         var corrections = new List<string>();
 
-        if (!NumberFuzzyMatch(heardNumbers, b.Elevation))
-        {
-            corrections.Add(
-                $"Line 4, target elevation {BrevityFormat.Digits(b.Elevation)} feet");
-        }
+        // Lines already confirmed in a previous readback attempt stay confirmed.
+        // For each not-yet-confirmed line: if heard correctly now, mark it; otherwise
+        // flag it for correction. Wrong/missing both result in a correction string —
+        // the pilot gets the right value either way.
+        Process(4, line4Ok,
+            $"Line 4, target elevation {BrevityFormat.Digits(b.Elevation)} feet");
+        Process(6, line6Ok,
+            $"Line 6, grid {BrevityFormat.Phonetic(b.GridLetters)}, " +
+            $"{BrevityFormat.Digits(b.GridEasting, padding: 4)}, " +
+            $"{BrevityFormat.Digits(b.GridNorthing, padding: 4)}");
+        Process(8, line8Ok,
+            $"Line 8, friendlies {BrevityFormat.Digits(b.FriendlyDistance)} meters {b.FriendlyDirection}");
 
-        var gridOk = heardLetters.Contains(b.GridLetters)
-                  && NumberFuzzyMatch(heardNumbers, b.GridEasting)
-                  && NumberFuzzyMatch(heardNumbers, b.GridNorthing);
-        if (!gridOk)
-        {
-            corrections.Add(
-                $"Line 6, grid {BrevityFormat.Phonetic(b.GridLetters)}, " +
-                $"{BrevityFormat.Digits(b.GridEasting, padding: 4)}, " +
-                $"{BrevityFormat.Digits(b.GridNorthing, padding: 4)}");
-        }
-
-        var friendlyOk = NumberFuzzyMatch(heardNumbers, b.FriendlyDistance)
-                      && heardDirections.Contains(b.FriendlyDirection);
-        if (!friendlyOk)
-        {
-            corrections.Add(
-                $"Line 8, friendlies {BrevityFormat.Digits(b.FriendlyDistance)} meters {b.FriendlyDirection}");
-        }
-
-        if (corrections.Count == 0)
+        if (_confirmedLines.Count == 3)
         {
             _state = FlowState.BriefDone;
             return $"{call.Caller}, {_shortName}, good readback. Cleared to engage when ready.";
         }
 
-        return $"{call.Caller}, {_shortName}, negative. Correction. " +
-               string.Join(". ", corrections) + ". Read back again.";
-    }
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"{call.Caller}, {_shortName}, ");
 
-    /// Exact match wins; otherwise allows a one-character edit on the digit
-    /// string to absorb one-digit Whisper mistakes (e.g. heard "661" for "681").
-    /// Won't bridge gaps of 2+ digits, so genuinely wrong values still fail.
-    private static bool NumberFuzzyMatch(HashSet<int> heard, int expected)
-    {
-        if (heard.Contains(expected)) return true;
+        if (newlyConfirmed.Count > 0)
+            sb.Append($"good copy {LineList(newlyConfirmed)}. ");
 
-        var expectedStr = expected.ToString();
-        foreach (var h in heard)
+        if (corrections.Count > 0)
         {
-            var hStr = h.ToString();
-            if (Math.Abs(hStr.Length - expectedStr.Length) > 1) continue;
-            if (LevenshteinDistance(hStr, expectedStr) <= 1) return true;
+            sb.Append("Negative. Correction. ");
+            sb.Append(string.Join(". ", corrections));
+            sb.Append(". ");
         }
-        return false;
+
+        var stillPending = new[] { 4, 6, 8 }
+            .Where(l => !_confirmedLines.Contains(l))
+            .ToList();
+        sb.Append($"Read back line{(stillPending.Count > 1 ? "s" : "")} {LineList(stillPending)}.");
+        return sb.ToString();
+
+        void Process(int line, bool ok, string correction)
+        {
+            if (_confirmedLines.Contains(line)) return;
+            if (ok)
+            {
+                _confirmedLines.Add(line);
+                newlyConfirmed.Add(line);
+            }
+            else
+            {
+                corrections.Add(correction);
+            }
+        }
     }
 
-    private static int LevenshteinDistance(string a, string b)
+    private static string LineList(IEnumerable<int> lines)
     {
-        if (a.Length == 0) return b.Length;
-        if (b.Length == 0) return a.Length;
-
-        var dp = new int[a.Length + 1, b.Length + 1];
-        for (int i = 0; i <= a.Length; i++) dp[i, 0] = i;
-        for (int j = 0; j <= b.Length; j++) dp[0, j] = j;
-
-        for (int i = 1; i <= a.Length; i++)
-            for (int j = 1; j <= b.Length; j++)
-            {
-                int cost = a[i - 1] == b[j - 1] ? 0 : 1;
-                dp[i, j] = Math.Min(
-                    Math.Min(dp[i - 1, j] + 1, dp[i, j - 1] + 1),
-                    dp[i - 1, j - 1] + cost);
-            }
-        return dp[a.Length, b.Length];
+        var arr = lines.ToArray();
+        return arr.Length switch
+        {
+            0 => "",
+            1 => arr[0].ToString(),
+            2 => $"{arr[0]} and {arr[1]}",
+            _ => $"{string.Join(", ", arr.Take(arr.Length - 1))}, and {arr[^1]}",
+        };
     }
 
     private static string Show<T>(IEnumerable<T> items)
@@ -312,53 +333,50 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         return arr.Length == 0 ? "(none)" : string.Join(", ", arr);
     }
 
-    /// Collects every plausible integer from the transcript. Multi-digit tokens are
-    /// taken as-is; runs of consecutive single-digit tokens (the result of "one two
-    /// zero zero" being normalized to "1 2 0 0") are also expanded into every
-    /// possible contiguous sub-sequence so any 2–8 digit value within a spelled run
-    /// is detectable.
+    /// Collects every plausible integer from the transcript.
+    ///
+    /// Treats *every contiguous run of digit tokens* (single OR multi-digit) as one
+    /// digit stream. Whisper is inconsistent — for "two-six-two-zero" it might emit
+    /// "2 6 2 0", "26 2 0", "2 6 20", or "2620". Joining the run and enumerating
+    /// every contiguous substring means all of those forms produce the same set of
+    /// candidate numbers (which includes 2620, 26, 620, etc.).
     private static HashSet<int> ExtractAllNumbers(string text)
     {
         var result = new HashSet<int>();
         var tokens = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
-        // Multi-digit tokens stand alone.
-        foreach (var t in tokens)
-        {
-            if (t.Length >= 2 && t.All(char.IsDigit) && int.TryParse(t, out var n))
-                result.Add(n);
-        }
-
-        // Runs of single-digit tokens — try every contiguous sub-sequence.
         int i = 0;
         while (i < tokens.Length)
         {
-            if (tokens[i].Length == 1 && char.IsDigit(tokens[i][0]))
-            {
-                int j = i;
-                while (j < tokens.Length && tokens[j].Length == 1 && char.IsDigit(tokens[j][0]))
-                    j++;
+            if (!IsAllDigits(tokens[i])) { i++; continue; }
 
-                for (int start = i; start < j; start++)
-                {
-                    var sb = new System.Text.StringBuilder();
-                    for (int end = start; end < j; end++)
-                    {
-                        sb.Append(tokens[end]);
-                        if (sb.Length <= 9 && int.TryParse(sb.ToString(), out var n))
-                            result.Add(n);
-                    }
-                }
-                i = j;
-            }
-            else
+            // Greedily consume the digit-token run, joining as we go.
+            var sb = new System.Text.StringBuilder();
+            int j = i;
+            while (j < tokens.Length && IsAllDigits(tokens[j]))
             {
-                i++;
+                sb.Append(tokens[j]);
+                j++;
             }
+
+            var run = sb.ToString();
+            // Every contiguous substring becomes a candidate.
+            for (int start = 0; start < run.Length; start++)
+            {
+                for (int len = 1; len <= 9 && start + len <= run.Length; len++)
+                {
+                    if (int.TryParse(run.AsSpan(start, len), out var n))
+                        result.Add(n);
+                }
+            }
+
+            i = j;
         }
 
         return result;
     }
+
+    private static bool IsAllDigits(string s) => s.Length > 0 && s.All(char.IsDigit);
 
     /// Finds every contiguous run of phonetic-alphabet words and yields all letter
     /// sub-strings ("papa alpha bravo" -> {"P","PA","PAB","A","AB","B"}). Whatever
