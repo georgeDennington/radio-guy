@@ -18,6 +18,12 @@ public sealed class WhisperTranscriber : ITranscriber
         "ready for the rest, say again, in hot from south, off west, cleared hot, " +
         "abort, BDA, IP alpha, type 2 in effect. " +
         "Readback: elevation feet, grid papa alpha, friendlies meters west. " +
+        "Carrier airboss phrases: Boss, ready cats, taxi to cat one, signal Charlie, " +
+        "BRC one eight zero, ten miles inbound, hold overhead angels two, " +
+        "stand by for commence, ready to push, cleared to push, descend pattern " +
+        "altitude eight hundred, in the break, downwind, abeam, gear and flaps, " +
+        "see you at the ball, roger ball, off the wire, good three wire trap, " +
+        "taxi to spot three. " +
         "Other: RTB, bingo, joker, tally, no joy, visual, blind, spike, splash, " +
         "fox two, fox three.";
 

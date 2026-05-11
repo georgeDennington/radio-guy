@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using RadioMan;
 using RadioMan.Agents;
 using RadioMan.Audio;
+using RadioMan.Dcs;
 using RadioMan.Parsing;
 using RadioMan.Responses;
 using RadioMan.Stt;
@@ -12,6 +13,8 @@ const int VK_ESCAPE = 0x1B;
 
 const string AwacsCallsign = "Wizard 1-1";
 const string JtacCallsign = "Hammer 1-1";
+const string AirbossCallsign = "Boss";
+const int DcsExportPort = 49152;
 
 if (args.Contains("--list-kokoro-voices"))
 {
@@ -36,13 +39,19 @@ Console.Write("Pre-warming TTS... ");
 }
 Console.WriteLine("done.");
 
-// Pick a fresh random voice for each agent on every startup, so AWACS and
-// JTAC sound different from each other AND different from last session. When
-// we later add more agents (per-flight, per-unit), this pool keeps expanding.
+// Pick fresh random voices for each agent on every startup, so they're
+// distinguishable from each other AND different from last session. When we
+// later add more agents (per-flight, per-unit), this pool keeps expanding.
 var voicePool = KokoroTts.AvailableMaleEnglishVoiceNames();
-var picks = KokoroTts.PickDistinctVoices(voicePool, count: 2);
+var picks = KokoroTts.PickDistinctVoices(voicePool, count: 3);
 var awacsVoice = picks.Count > 0 ? picks[0] : "am_michael";
 var jtacVoice = picks.Count > 1 ? picks[1] : awacsVoice;
+var airbossVoice = picks.Count > 2 ? picks[2] : awacsVoice;
+
+// DCS Export client listens on localhost for snapshots from the Lua side.
+// Stays valid even if DCS isn't running — the Tower just degrades to generic
+// responses without specific data.
+using var dcs = new DcsExportClient(DcsExportPort);
 
 Console.WriteLine("Setting up agents:");
 var awacs = new RadioAgent(
@@ -59,7 +68,14 @@ var jtac = new RadioAgent(
     responder: new JtacResponseGenerator(JtacCallsign),
     tts: new KokoroTts(sharedKokoro, jtacVoice, speed: 0.85f));
 
-var agents = new[] { awacs, jtac };
+var airboss = new RadioAgent(
+    role: "AIRBOSS",
+    callsign: AirbossCallsign,
+    parser: new RegexIntentParser(AirbossCallsign, IntentRulesets.Airboss),
+    responder: new AirbossResponseGenerator(dcs, Carriers.Roosevelt),
+    tts: new KokoroTts(sharedKokoro, airbossVoice, speed: 1.0f));
+
+var agents = new[] { awacs, jtac, airboss };
 
 using var pipeline = new RadioPipeline(
     input: new MicAudioInput(),

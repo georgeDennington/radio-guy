@@ -18,6 +18,42 @@ public static class IntentRulesets
             new Regex(@"\b(?:request(?:ing)?\s+)?declare\b", RxOpts)),
     };
 
+    public static readonly IReadOnlyList<RegexIntentParser.IntentRule> Airboss = new[]
+    {
+        // "ready cats" / "ready for launch" / "ready to launch" / "ready on the cat"
+        new RegexIntentParser.IntentRule(Intent.AirbossReadyForLaunch,
+            new Regex(@"\bready\s+(?:cats?|on\s+(?:the\s+)?cat|to\s+launch|for\s+launch)\b", RxOpts)),
+
+        // "off the wire" / "out of the wire" / "clear of the landing area"
+        new RegexIntentParser.IntentRule(Intent.AirbossOffWire,
+            new Regex(@"\b(?:off|out\s+of)\s+(?:the\s+)?(?:wire|wires|gear)\b|\bclear\s+of\s+(?:the\s+)?landing\b", RxOpts)),
+
+        // The ball call: must come BEFORE inbound so "see you at the ball" doesn't
+        // get captured by a too-greedy inbound rule.
+        new RegexIntentParser.IntentRule(Intent.AirbossBall,
+            new Regex(@"\b(?:see\s+you\s+at\s+(?:the\s+)?ball|ball)\b", RxOpts)),
+
+        // Ready to descend from overhead to the break. Specific enough to not
+        // collide with "ready cats" (launch) or generic "ready".
+        new RegexIntentParser.IntentRule(Intent.AirbossCommence,
+            new Regex(@"\b(?:ready\s+to\s+(?:push|commence)|commencing|pushing\s+for\s+(?:the\s+)?break)\b", RxOpts)),
+
+        // In the break — pilot rolling in over the bow into downwind.
+        new RegexIntentParser.IntentRule(Intent.AirbossInTheBreak,
+            new Regex(@"\bin\s+the\s+break\b|\bbreaking\s+(?:left|right|now)\b", RxOpts)),
+
+        // Abeam call (downwind, abeam LSO platform).
+        new RegexIntentParser.IntentRule(Intent.AirbossAbeam,
+            new Regex(@"\babeam\b", RxOpts)),
+
+        // Inbound / initial: "ten miles inbound", "three mile initial", "X miles out".
+        new RegexIntentParser.IntentRule(Intent.AirbossInbound,
+            new Regex(@"\b(?:inbound|initial|miles\s+out|request(?:ing)?\s+(?:recovery|to\s+land))\b", RxOpts)),
+
+        new RegexIntentParser.IntentRule(Intent.AirbossSayAgain,
+            new Regex(@"\b(?:say\s+again|repeat(?:\s+your\s+last)?)\b", RxOpts)),
+    };
+
     // Order matters: most-specific patterns first so the permissive
     // "ReadyForRest" rule doesn't swallow "ready for tasking" / "ready for 9-line".
     public static readonly IReadOnlyList<RegexIntentParser.IntentRule> Jtac = new[]
