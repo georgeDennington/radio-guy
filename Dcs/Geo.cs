@@ -50,5 +50,55 @@ public static class Geo
         return d;
     }
 
+    /// Bearing and range from a bullseye to a contact, the way AWACS reads it out.
+    /// Returns bearing in [0, 360) degrees true, range in nautical miles.
+    public static (double Bearing, double RangeNm) BullseyeRelative(
+        double bullseyeLat, double bullseyeLon,
+        double pointLat, double pointLon)
+    {
+        var bearing = BearingDeg(bullseyeLat, bullseyeLon, pointLat, pointLon);
+        var range = DistanceNm(bullseyeLat, bullseyeLon, pointLat, pointLon);
+        return (bearing, range);
+    }
+
+    /// Aspect of a target relative to an observer: "hot" (target's nose pointing
+    /// at observer), "flank" (target moving perpendicular), "cold" (target moving
+    /// away). Uses the target's true heading and where the observer is from the
+    /// target's perspective.
+    public static string AspectFrom(
+        double targetLat, double targetLon, double targetHeadingDeg,
+        double observerLat, double observerLon)
+    {
+        var bearingTargetToObs = BearingDeg(targetLat, targetLon, observerLat, observerLon);
+        var diff = Math.Abs(AngleDiffDeg(targetHeadingDeg, bearingTargetToObs));
+
+        if (diff <= 30) return "hot";
+        if (diff <= 60) return "hot flank";
+        if (diff <= 120) return "flank";
+        if (diff <= 150) return "cold flank";
+        return "cold";
+    }
+
+    /// Standard altitude band naming for the picture call.
+    public static string AltitudeBand(double altFt) => altFt switch
+    {
+        < 5_000  => "low",
+        < 15_000 => "medium",
+        < 30_000 => "high",
+        _        => "very high",
+    };
+
+    /// Project a point a given bearing+range from a starting lat/lon. Flat-earth
+    /// approximation — fine for the ~50nm distances pilots use radar bearings
+    /// over. (For longer hauls you'd want proper great-circle math.)
+    public static (double Lat, double Lon) ProjectFrom(
+        double lat, double lon, double bearingDeg, double rangeNm)
+    {
+        var rad = bearingDeg * Math.PI / 180.0;
+        var dLat = rangeNm * Math.Cos(rad) / 60.0;
+        var dLon = rangeNm * Math.Sin(rad) / (60.0 * Math.Cos(lat * Math.PI / 180.0));
+        return (lat + dLat, lon + dLon);
+    }
+
     private static double ToRad(double deg) => deg * Math.PI / 180.0;
 }

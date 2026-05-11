@@ -22,16 +22,22 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
     };
 
     private readonly string _shortName;
-    private readonly DcsExportClient _dcs;
+    private readonly IDcsClient _dcs;
     private readonly Carrier _carrier;
     private string _lastResponse = "";
 
-    public AirbossResponseGenerator(DcsExportClient dcs, Carrier carrier)
+    public AirbossResponseGenerator(IDcsClient dcs, Carrier carrier)
     {
         _shortName = carrier.AirbossCallsign;
         _dcs = dcs;
         _carrier = carrier;
     }
+
+    /// Resolves the caller's live position via gRPC, or returns null when DCS
+    /// isn't connected / the player isn't tracked. Generators use the null
+    /// case to degrade to generic responses.
+    private AircraftSnapshot? PlayerFor(RadioCall call)
+        => call.Caller is null ? null : _dcs.PlayerByCallsign(call.Caller);
 
     public string Respond(RadioCall call)
     {
@@ -88,7 +94,8 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
     {
         var holdAngels = Rng.Next(2, 5); // 2, 3, or 4 thousand feet
 
-        if (!_dcs.HasFreshData)
+        var player = PlayerFor(call);
+        if (player is null)
         {
             return $"{call.Caller}, {_shortName}, signal Charlie, " +
                    $"hold overhead, angels {BrevityFormat.Digits(holdAngels)}. " +
@@ -96,13 +103,12 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
                    $"Stand by for commence.";
         }
 
-        var snap = _dcs.Latest!;
-        var distNm = Geo.DistanceNm(snap.Lat, snap.Lon, _carrier.Lat, _carrier.Lon);
+        var distNm = Geo.DistanceNm(player.Lat, player.Lon, _carrier.Lat, _carrier.Lon);
 
         // Sanity check: if pilot says "inbound" but they're way out, push back.
         if (distNm > 30)
         {
-            var bearingFromShip = Geo.BearingDeg(_carrier.Lat, _carrier.Lon, snap.Lat, snap.Lon);
+            var bearingFromShip = Geo.BearingDeg(_carrier.Lat, _carrier.Lon, player.Lat, player.Lon);
             var dir = Geo.CompassFromBearing(bearingFromShip);
             return $"{call.Caller}, {_shortName}, no contact. " +
                    $"Show you {BrevityFormat.Digits((int)Math.Round(distNm))} miles {dir}. " +
@@ -135,14 +141,14 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
     private string InTheBreak(RadioCall call)
     {
         var altCheck = "";
-        if (_dcs.HasFreshData)
+        var player = PlayerFor(call);
+        if (player is not null)
         {
-            var snap = _dcs.Latest!;
             // Initial break should be at ~800ft. Anything wildly off, flag it.
-            if (snap.AltFt < 400 || snap.AltFt > 1500)
+            if (player.AltFt < 400 || player.AltFt > 1500)
             {
                 altCheck = $" Check altitude — show you " +
-                           $"{BrevityFormat.Digits((int)Math.Round(snap.AltFt))} feet.";
+                           $"{BrevityFormat.Digits((int)Math.Round(player.AltFt))} feet.";
             }
         }
 
@@ -154,15 +160,15 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
     /// configured for landing. Boss acknowledges; turn to base comes next.
     private string Abeam(RadioCall call)
     {
-        if (!_dcs.HasFreshData)
+        var player = PlayerFor(call);
+        if (player is null)
             return $"Roger, {ShortCaller(call)}, continue.";
 
-        var snap = _dcs.Latest!;
         // Pattern altitude is ~600 ft AGL. Anything outside 400-900 is wrong.
-        if (snap.AltFt < 400 || snap.AltFt > 900)
+        if (player.AltFt < 400 || player.AltFt > 900)
         {
             return $"{call.Caller}, {_shortName}, you're " +
-                   $"{BrevityFormat.Digits((int)Math.Round(snap.AltFt))} feet. " +
+                   $"{BrevityFormat.Digits((int)Math.Round(player.AltFt))} feet. " +
                    $"Pattern altitude is 600. Correct your altitude.";
         }
 
@@ -171,12 +177,12 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
 
     private string Ball(RadioCall call)
     {
-        if (!_dcs.HasFreshData)
+        var player = PlayerFor(call);
+        if (player is null)
             return $"Roger ball, {ShortCaller(call)}.";
 
-        var snap = _dcs.Latest!;
-        var distNm = Geo.DistanceNm(snap.Lat, snap.Lon, _carrier.Lat, _carrier.Lon);
-        var altAgl = snap.AltFt;  // ship is ~60ft above water, close enough to MSL
+        var distNm = Geo.DistanceNm(player.Lat, player.Lon, _carrier.Lat, _carrier.Lon);
+        var altAgl = player.AltFt;  // ship is ~60ft above water, close enough to MSL
 
         // "Ball" call is at ~3/4 mile, ~370 ft. Anything wildly off, push back.
         if (distNm > 2 || altAgl > 1500)

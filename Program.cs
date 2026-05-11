@@ -14,7 +14,6 @@ const int VK_ESCAPE = 0x1B;
 const string AwacsCallsign = "Wizard 1-1";
 const string JtacCallsign = "Hammer 1-1";
 const string AirbossCallsign = "Boss";
-const int DcsExportPort = 49152;
 
 if (args.Contains("--list-kokoro-voices"))
 {
@@ -48,17 +47,23 @@ var awacsVoice = picks.Count > 0 ? picks[0] : "am_michael";
 var jtacVoice = picks.Count > 1 ? picks[1] : awacsVoice;
 var airbossVoice = picks.Count > 2 ? picks[2] : awacsVoice;
 
-// DCS Export client listens on localhost for snapshots from the Lua side.
-// Stays valid even if DCS isn't running — the Tower just degrades to generic
-// responses without specific data.
-using var dcs = new DcsExportClient(DcsExportPort);
+// DCS data source. Defaults to the real gRPC client which talks to
+// DCS-gRPC (https://github.com/DCS-gRPC/rust-server). Pass `--offline`
+// to skip the gRPC connection entirely — useful for developing the voice
+// pipeline without DCS open. Either way, the system stays usable: when
+// no fresh data is available, response generators degrade to generic
+// responses.
+IDcsClient dcs = args.Contains("--offline")
+    ? new OfflineDcsClient()
+    : new DcsGrpcClient();
+using var _dcsDispose = dcs;
 
 Console.WriteLine("Setting up agents:");
 var awacs = new RadioAgent(
     role: "AWACS",
     callsign: AwacsCallsign,
     parser: new RegexIntentParser(AwacsCallsign, IntentRulesets.Awacs),
-    responder: new AwacsResponseGenerator(AwacsCallsign),
+    responder: new AwacsResponseGenerator(dcs, AwacsCallsign),
     tts: new KokoroTts(sharedKokoro, awacsVoice, speed: 1.0f));
 
 var jtac = new RadioAgent(
