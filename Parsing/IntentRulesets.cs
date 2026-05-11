@@ -8,6 +8,7 @@ public static class IntentRulesets
 
     public static readonly IReadOnlyList<RegexIntentParser.IntentRule> Awacs = new[]
     {
+        // Specific calls first.
         new RegexIntentParser.IntentRule(Intent.AwacsPicture,
             new Regex(@"\b(?:request(?:ing)?\s+)?picture\b", RxOpts)),
 
@@ -16,6 +17,14 @@ public static class IntentRulesets
 
         new RegexIntentParser.IntentRule(Intent.AwacsDeclare,
             new Regex(@"\b(?:request(?:ing)?\s+)?declare\b", RxOpts)),
+
+        // Check-out before check-in so "checking out" doesn't match the
+        // generic "check" prefix of check-in.
+        new RegexIntentParser.IntentRule(Intent.AwacsCheckOut,
+            new Regex(@"\b(?:checking\s+out|check\s+out|off\s+station|departing\s+(?:freq|frequency)|see\s+ya)\b", RxOpts)),
+
+        new RegexIntentParser.IntentRule(Intent.AwacsCheckIn,
+            new Regex(@"\b(?:checking\s+in|check\s+in|on\s+station|with\s+you)\b", RxOpts)),
     };
 
     public static readonly IReadOnlyList<RegexIntentParser.IntentRule> Airboss = new[]

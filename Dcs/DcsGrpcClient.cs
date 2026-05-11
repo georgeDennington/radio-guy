@@ -39,7 +39,12 @@ public sealed class DcsGrpcClient : IDcsClient
         _channel = GrpcChannel.ForAddress(endpoint);
         _mission = new MissionService.MissionServiceClient(_channel);
         _coalition = new CoalitionService.CoalitionServiceClient(_channel);
-        _ = Task.Run(StreamLoopAsync);
+        // Three category streams — airplanes for AWACS/players, ships for
+        // carriers, ground for JTAC-capable vehicles. Each has its own
+        // independent retry loop and shares the _aircraft dictionary.
+        _ = Task.Run(() => StreamCategoryLoopAsync(GroupCategory.Airplane));
+        _ = Task.Run(() => StreamCategoryLoopAsync(GroupCategory.Ship));
+        _ = Task.Run(() => StreamCategoryLoopAsync(GroupCategory.Ground));
     }
 
     public AircraftSnapshot? PlayerByCallsign(string callsign)
@@ -91,7 +96,7 @@ public sealed class DcsGrpcClient : IDcsClient
     private static string Normalize(string s)
         => new string((s ?? "").Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
 
-    private async Task StreamLoopAsync()
+    private async Task StreamCategoryLoopAsync(GroupCategory category)
     {
         var consecutiveFailures = 0;
         while (!_cts.IsCancellationRequested)
@@ -103,7 +108,7 @@ public sealed class DcsGrpcClient : IDcsClient
                     {
                         PollRate = 1,
                         MaxBackoff = 30,
-                        Category = GroupCategory.Airplane,
+                        Category = category,
                     },
                     cancellationToken: _cts.Token);
 
@@ -125,12 +130,14 @@ public sealed class DcsGrpcClient : IDcsClient
             }
             catch (Exception ex)
             {
-                if (IsConnected || consecutiveFailures == 0)
+                // Only log first failure per category to avoid spam — three
+                // concurrent loops all logging "unavailable" every 5s is noise.
+                if (consecutiveFailures == 0)
                 {
-                    IsConnected = false;
-                    Console.WriteLine($"[dcs] gRPC unavailable ({ex.GetType().Name}: {ShortMsg(ex)}). " +
-                                      $"Will retry every 5s. radio-man stays usable in offline mode.");
+                    Console.WriteLine($"[dcs:{category}] gRPC unavailable ({ex.GetType().Name}: {ShortMsg(ex)}). " +
+                                      $"Will retry every 5s.");
                 }
+                IsConnected = false;
                 consecutiveFailures++;
 
                 try { await Task.Delay(TimeSpan.FromSeconds(5), _cts.Token); }

@@ -1,7 +1,11 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 
 namespace RadioMan.Responses;
 
+/// JTAC. Multi-unit aware — one generator serves any number of JTAC units in
+/// the field. Per-recipient state machine: each JTAC callsign tracks its own
+/// 9-line, readback, cleared-hot, off-wire flow independently.
 public sealed class JtacResponseGenerator : IResponseGenerator
 {
     private static readonly Random Rng = new();
@@ -24,8 +28,6 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         "north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"
     };
 
-    // Includes common Whisper mistranscriptions of NATO phonetic words —
-    // "lemur"/"leemur" for Lima, "poppa" for Papa, "alfa" for Alpha, etc.
     private static readonly Dictionary<string, char> PhoneticReverse = new(StringComparer.OrdinalIgnoreCase)
     {
         ["alpha"] = 'A', ["alfa"] = 'A', ["alphas"] = 'A',
@@ -65,107 +67,124 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         ClearedHot, Complete,
     }
 
-    private readonly string _shortName;
-
-    private FlowState _state = FlowState.Idle;
-    private NineLineBrief? _brief;
-    private string _lastResponse = "";
-    private readonly HashSet<int> _confirmedLines = new();
-
-    public JtacResponseGenerator(string callsign = "Hammer 1-1")
+    /// Per-recipient state. One per JTAC callsign in play.
+    private sealed class BriefState
     {
-        _shortName = callsign.Split(' ', 2)[0];
+        public FlowState Flow = FlowState.Idle;
+        public NineLineBrief? Brief;
+        public string LastResponse = "";
+        public readonly HashSet<int> ConfirmedLines = new();
     }
+
+    private readonly ConcurrentDictionary<string, BriefState> _states =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// Used only by AvailableNext to show contextually-appropriate options
+    /// for whichever JTAC was last talked to. Pure UX — doesn't affect routing.
+    private string _lastRecipient = "Hammer";
+
+    /// Example recipient name shown in AvailableNext when no real one has been
+    /// addressed yet.
+    private readonly string _exampleRecipient;
+
+    public JtacResponseGenerator(string exampleRecipient = "Hammer")
+    {
+        _exampleRecipient = exampleRecipient;
+        _lastRecipient = exampleRecipient;
+    }
+
+    private BriefState GetState(string recipient)
+        => _states.GetOrAdd(recipient, _ => new BriefState());
 
     public string Respond(RadioCall call)
     {
-        var response = Dispatch(call);
+        _lastRecipient = call.Recipient;
+        var state = GetState(call.Recipient);
+        var response = Dispatch(call, state);
         if (call.Intent != Intent.JtacSayAgain)
-            _lastResponse = response;
+            state.LastResponse = response;
         return response;
     }
 
     public IReadOnlyList<NextStep> AvailableNext()
     {
+        var recipient = _lastRecipient;
+        var state = _states.TryGetValue(recipient, out var s) ? s : new BriefState();
         var list = new List<NextStep>();
         var caller = "Viper 2-1";
 
-        switch (_state)
+        switch (state.Flow)
         {
             case FlowState.Idle:
             case FlowState.Complete:
-                list.Add(new("check in",       $"{_shortName}, {caller}, ready for tasking"));
-                list.Add(new("request 9-line", $"{_shortName}, {caller}, ready for 9-line"));
+                list.Add(new("check in",       $"{recipient}, {caller}, ready for tasking"));
+                list.Add(new("request 9-line", $"{recipient}, {caller}, ready for 9-line"));
                 break;
 
             case FlowState.CheckedIn:
-                list.Add(new("request 9-line", $"{_shortName}, {caller}, ready for 9-line"));
+                list.Add(new("request 9-line", $"{recipient}, {caller}, ready for 9-line"));
                 break;
 
             case FlowState.BriefInProgress1:
             case FlowState.BriefInProgress2:
-                list.Add(new("continue brief", $"{_shortName}, {caller}, go ahead"));
+                list.Add(new("continue brief", $"{recipient}, {caller}, go ahead"));
                 break;
 
             case FlowState.AwaitingReadback:
             {
-                var b = _brief!;
-                var pending = new[] { 4, 6, 8 }.Where(l => !_confirmedLines.Contains(l)).ToList();
-
-                var parts = new List<string>();
-                if (pending.Contains(4)) parts.Add($"elevation {b.Elevation} feet");
-                if (pending.Contains(6)) parts.Add($"grid {b.GridLetters} {b.GridEasting:D4} {b.GridNorthing:D4}");
-                if (pending.Contains(8)) parts.Add($"friendlies {b.FriendlyDistance} meters {b.FriendlyDirection}");
-
-                var hint = pending.Count == 1
-                    ? $"readback line {pending[0]}"
-                    : $"readback {string.Join("/", pending)}";
-                list.Add(new(hint, $"{_shortName}, {caller}, {string.Join(", ", parts)}"));
+                var b = state.Brief!;
+                var ex = $"{recipient}, {caller}, " +
+                         $"elevation {b.Elevation} feet, " +
+                         $"grid {b.GridLetters} {b.GridEasting:D4} {b.GridNorthing:D4}, " +
+                         $"friendlies {b.FriendlyDistance} meters {b.FriendlyDirection}";
+                list.Add(new("readback 4, 6, 8", ex));
                 break;
             }
 
             case FlowState.BriefDone:
-                list.Add(new("calling in",     $"{_shortName}, {caller}, in hot from south"));
+                list.Add(new("calling in",     $"{recipient}, {caller}, in hot from south"));
                 break;
 
             case FlowState.ClearedHot:
-                list.Add(new("off target",     $"{_shortName}, {caller}, off west"));
+                list.Add(new("off target",     $"{recipient}, {caller}, off west"));
                 break;
         }
 
-        if (!string.IsNullOrEmpty(_lastResponse))
-            list.Add(new("say again", $"{_shortName}, {caller}, say again"));
+        if (!string.IsNullOrEmpty(state.LastResponse))
+            list.Add(new("say again", $"{recipient}, {caller}, say again"));
 
         return list;
     }
 
-    private string Dispatch(RadioCall call)
+    private string Dispatch(RadioCall call, BriefState state)
     {
+        var recipient = call.Recipient;
+
         switch (call.Intent)
         {
             case Intent.JtacCheckIn:
-                _state = FlowState.CheckedIn;
-                return $"{call.Caller}, {_shortName}, copy your check-in. " +
+                state.Flow = FlowState.CheckedIn;
+                return $"{call.Caller}, {recipient}, copy your check-in. " +
                        "Tasking to follow. Advise ready for 9-line.";
 
             case Intent.JtacRequest9Line:
-                if (_state is FlowState.Idle or FlowState.CheckedIn or FlowState.Complete)
+                if (state.Flow is FlowState.Idle or FlowState.CheckedIn or FlowState.Complete)
                 {
-                    _brief = Generate9Line();
-                    _confirmedLines.Clear();
-                    _state = FlowState.BriefInProgress1;
-                    return $"{call.Caller}, {_shortName}, type 2 in effect. " +
-                           $"Line 1, IP {_brief.Ip}. Break. " +
-                           $"Line 2, heading {BrevityFormat.Digits(_brief.Heading, padding: 3)}, {_brief.Offset}. Break. " +
-                           $"Line 3, distance {BrevityFormat.Decimal(_brief.Distance)} miles. " +
+                    state.Brief = Generate9Line();
+                    state.ConfirmedLines.Clear();
+                    state.Flow = FlowState.BriefInProgress1;
+                    return $"{call.Caller}, {recipient}, type 2 in effect. " +
+                           $"Line 1, IP {state.Brief.Ip}. Break. " +
+                           $"Line 2, heading {BrevityFormat.Digits(state.Brief.Heading, padding: 3)}, {state.Brief.Offset}. Break. " +
+                           $"Line 3, distance {BrevityFormat.Decimal(state.Brief.Distance)} miles. " +
                            "Advise ready for the rest.";
                 }
-                return $"{call.Caller}, {_shortName}, brief already in progress.";
+                return $"{call.Caller}, {recipient}, brief already in progress.";
 
-            case Intent.JtacReadyForRest when _state == FlowState.BriefInProgress1:
+            case Intent.JtacReadyForRest when state.Flow == FlowState.BriefInProgress1:
             {
-                var b = _brief!;
-                _state = FlowState.BriefInProgress2;
+                var b = state.Brief!;
+                state.Flow = FlowState.BriefInProgress2;
                 return $"{call.Caller}, copy. " +
                        $"Line 4, target elevation {BrevityFormat.Digits(b.Elevation)} feet. Break. " +
                        $"Line 5, target description, {BrevityFormat.Digits(b.TargetCount)} {b.TargetType}. Break. " +
@@ -176,10 +195,10 @@ public sealed class JtacResponseGenerator : IResponseGenerator
                        "Advise ready for the rest.";
             }
 
-            case Intent.JtacReadyForRest when _state == FlowState.BriefInProgress2:
+            case Intent.JtacReadyForRest when state.Flow == FlowState.BriefInProgress2:
             {
-                var b = _brief!;
-                _state = FlowState.AwaitingReadback;
+                var b = state.Brief!;
+                state.Flow = FlowState.AwaitingReadback;
                 return $"{call.Caller}, copy. " +
                        $"Line 7, mark with {SpellMark(b)}. Break. " +
                        $"Line 8, friendlies {BrevityFormat.Digits(b.FriendlyDistance)} meters {b.FriendlyDirection}. Break. " +
@@ -188,57 +207,56 @@ public sealed class JtacResponseGenerator : IResponseGenerator
             }
 
             case Intent.JtacReadyForRest:
-                return $"{call.Caller}, {_shortName}, no brief in progress.";
+                return $"{call.Caller}, {recipient}, no brief in progress.";
 
-            case Intent.JtacReadback when _state == FlowState.AwaitingReadback:
-                return VerifyReadback(call);
+            case Intent.JtacReadback when state.Flow == FlowState.AwaitingReadback:
+                return VerifyReadback(call, state);
 
             case Intent.JtacReadback:
-                return $"{call.Caller}, {_shortName}, no readback expected.";
+                return $"{call.Caller}, {recipient}, no readback expected.";
 
-            case Intent.JtacCallingIn when _state == FlowState.BriefDone:
-                _state = FlowState.ClearedHot;
-                return $"{call.Caller}, {_shortName}, cleared hot.";
+            case Intent.JtacCallingIn when state.Flow == FlowState.BriefDone:
+                state.Flow = FlowState.ClearedHot;
+                return $"{call.Caller}, {recipient}, cleared hot.";
 
-            case Intent.JtacCallingIn when _state == FlowState.AwaitingReadback:
-                return $"{call.Caller}, {_shortName}, negative clearance. Read back lines 4, 6, and 8 first.";
+            case Intent.JtacCallingIn when state.Flow == FlowState.AwaitingReadback:
+                return $"{call.Caller}, {recipient}, negative clearance. Read back lines 4, 6, and 8 first.";
 
             case Intent.JtacCallingIn:
-                return $"{call.Caller}, {_shortName}, abort, abort, abort. No clearance.";
+                return $"{call.Caller}, {recipient}, abort, abort, abort. No clearance.";
 
-            case Intent.JtacOff when _state == FlowState.ClearedHot:
-                _state = FlowState.Complete;
-                return $"{call.Caller}, {_shortName}, copy off. Pass BDA when able.";
+            case Intent.JtacOff when state.Flow == FlowState.ClearedHot:
+                state.Flow = FlowState.Complete;
+                return $"{call.Caller}, {recipient}, copy off. Pass BDA when able.";
 
             case Intent.JtacOff:
-                return $"{call.Caller}, {_shortName}, copy.";
+                return $"{call.Caller}, {recipient}, copy.";
 
             case Intent.JtacSayAgain:
-                return string.IsNullOrEmpty(_lastResponse)
-                    ? $"{call.Caller}, {_shortName}, no prior transmission to repeat."
-                    : _lastResponse;
+                return string.IsNullOrEmpty(state.LastResponse)
+                    ? $"{call.Caller}, {recipient}, no prior transmission to repeat."
+                    : state.LastResponse;
 
             case Intent.Unrecognized:
                 return Unrecognized(call);
 
             default:
-                return $"{call.Caller}, {_shortName}, unable.";
+                return $"{call.Caller}, {recipient}, unable.";
         }
     }
 
     private string Unrecognized(RadioCall call)
     {
         if (call.Caller is null)
-            return $"Unknown station calling {_shortName}, say again your callsign.";
+            return $"Unknown station calling {call.Recipient}, say again your callsign.";
 
         var options = string.Join(", ", AvailableNext().Select(s => s.Hint));
-        return $"{call.Caller}, {_shortName}, did not copy. " +
-               $"Possible calls: {options}.";
+        return $"{call.Caller}, {call.Recipient}, did not copy. Possible calls: {options}.";
     }
 
-    private string VerifyReadback(RadioCall call)
+    private string VerifyReadback(RadioCall call, BriefState state)
     {
-        var b = _brief!;
+        var b = state.Brief!;
         var text = call.NormalizedText;
 
         var heardNumbers = ExtractAllNumbers(text);
@@ -250,7 +268,7 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         Console.WriteLine($"    heard letters   : {Show(heardLetters.OrderBy(s => s).Take(20))}");
         Console.WriteLine($"    heard directions: {Show(heardDirections)}");
         Console.WriteLine($"    expected        : elev={b.Elevation}, grid={b.GridLetters} {b.GridEasting:D4}/{b.GridNorthing:D4}, friend={b.FriendlyDistance}m {b.FriendlyDirection}");
-        Console.WriteLine($"    prior confirmed : {Show(_confirmedLines.OrderBy(n => n))}");
+        Console.WriteLine($"    prior confirmed : {Show(state.ConfirmedLines.OrderBy(n => n))}");
 
         var line4Ok = heardNumbers.Contains(b.Elevation);
         var line6Ok = heardLetters.Contains(b.GridLetters)
@@ -262,10 +280,6 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         var newlyConfirmed = new List<int>();
         var corrections = new List<string>();
 
-        // Lines already confirmed in a previous readback attempt stay confirmed.
-        // For each not-yet-confirmed line: if heard correctly now, mark it; otherwise
-        // flag it for correction. Wrong/missing both result in a correction string —
-        // the pilot gets the right value either way.
         Process(4, line4Ok,
             $"Line 4, target elevation {BrevityFormat.Digits(b.Elevation)} feet");
         Process(6, line6Ok,
@@ -275,14 +289,14 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         Process(8, line8Ok,
             $"Line 8, friendlies {BrevityFormat.Digits(b.FriendlyDistance)} meters {b.FriendlyDirection}");
 
-        if (_confirmedLines.Count == 3)
+        if (state.ConfirmedLines.Count == 3)
         {
-            _state = FlowState.BriefDone;
-            return $"{call.Caller}, {_shortName}, good readback. Cleared to engage when ready.";
+            state.Flow = FlowState.BriefDone;
+            return $"{call.Caller}, {call.Recipient}, good readback. Cleared to engage when ready.";
         }
 
         var sb = new System.Text.StringBuilder();
-        sb.Append($"{call.Caller}, {_shortName}, ");
+        sb.Append($"{call.Caller}, {call.Recipient}, ");
 
         if (newlyConfirmed.Count > 0)
             sb.Append($"good copy {LineList(newlyConfirmed)}. ");
@@ -295,17 +309,17 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         }
 
         var stillPending = new[] { 4, 6, 8 }
-            .Where(l => !_confirmedLines.Contains(l))
+            .Where(l => !state.ConfirmedLines.Contains(l))
             .ToList();
         sb.Append($"Read back line{(stillPending.Count > 1 ? "s" : "")} {LineList(stillPending)}.");
         return sb.ToString();
 
         void Process(int line, bool ok, string correction)
         {
-            if (_confirmedLines.Contains(line)) return;
+            if (state.ConfirmedLines.Contains(line)) return;
             if (ok)
             {
-                _confirmedLines.Add(line);
+                state.ConfirmedLines.Add(line);
                 newlyConfirmed.Add(line);
             }
             else
@@ -327,19 +341,6 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         };
     }
 
-    private static string Show<T>(IEnumerable<T> items)
-    {
-        var arr = items.ToArray();
-        return arr.Length == 0 ? "(none)" : string.Join(", ", arr);
-    }
-
-    /// Collects every plausible integer from the transcript.
-    ///
-    /// Treats *every contiguous run of digit tokens* (single OR multi-digit) as one
-    /// digit stream. Whisper is inconsistent — for "two-six-two-zero" it might emit
-    /// "2 6 2 0", "26 2 0", "2 6 20", or "2620". Joining the run and enumerating
-    /// every contiguous substring means all of those forms produce the same set of
-    /// candidate numbers (which includes 2620, 26, 620, etc.).
     private static HashSet<int> ExtractAllNumbers(string text)
     {
         var result = new HashSet<int>();
@@ -350,7 +351,6 @@ public sealed class JtacResponseGenerator : IResponseGenerator
         {
             if (!IsAllDigits(tokens[i])) { i++; continue; }
 
-            // Greedily consume the digit-token run, joining as we go.
             var sb = new System.Text.StringBuilder();
             int j = i;
             while (j < tokens.Length && IsAllDigits(tokens[j]))
@@ -360,7 +360,6 @@ public sealed class JtacResponseGenerator : IResponseGenerator
             }
 
             var run = sb.ToString();
-            // Every contiguous substring becomes a candidate.
             for (int start = 0; start < run.Length; start++)
             {
                 for (int len = 1; len <= 9 && start + len <= run.Length; len++)
@@ -369,7 +368,6 @@ public sealed class JtacResponseGenerator : IResponseGenerator
                         result.Add(n);
                 }
             }
-
             i = j;
         }
 
@@ -378,9 +376,6 @@ public sealed class JtacResponseGenerator : IResponseGenerator
 
     private static bool IsAllDigits(string s) => s.Length > 0 && s.All(char.IsDigit);
 
-    /// Finds every contiguous run of phonetic-alphabet words and yields all letter
-    /// sub-strings ("papa alpha bravo" -> {"P","PA","PAB","A","AB","B"}). Whatever
-    /// the pilot says around the grid letters, the expected pair will be in there.
     private static HashSet<string> ExtractAllPhoneticCombinations(string text)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -406,12 +401,8 @@ public sealed class JtacResponseGenerator : IResponseGenerator
                 }
                 i = j;
             }
-            else
-            {
-                i++;
-            }
+            else { i++; }
         }
-
         return result;
     }
 
@@ -424,6 +415,12 @@ public sealed class JtacResponseGenerator : IResponseGenerator
                 result.Add(d);
         }
         return result;
+    }
+
+    private static string Show<T>(IEnumerable<T> items)
+    {
+        var arr = items.ToArray();
+        return arr.Length == 0 ? "(none)" : string.Join(", ", arr);
     }
 
     private static string SpellMark(NineLineBrief b) => b.MarkType switch

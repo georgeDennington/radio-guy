@@ -1,17 +1,14 @@
+using System.Collections.Concurrent;
 using RadioMan.Dcs;
 
 namespace RadioMan.Responses;
 
-/// Carrier airboss. Runs launches and recoveries.
+/// Carrier airboss. Multi-carrier aware — one generator serves any number of
+/// carriers in the mission. Per-recipient state (Carrier record, last response
+/// for "say again") is keyed by recipient callsign (e.g. "Boss", "Mother", etc.).
 ///
-/// Handles the part the airboss actually does — deck state, cat clearances,
-/// signal Charlie, the "roger ball" handoff, post-trap taxi. It does NOT do
-/// LSO talkdown (the rapid "power"/"right for lineup"/"easy with it" calls
-/// during the last 15 seconds of an approach) — that's a separate role and
-/// the user explicitly excluded it.
-///
-/// Pulls real player position from DcsExportClient so range/bearing-from-mom
-/// in the responses match where the pilot actually is.
+/// Handles the Case I recovery / launch sequence. Does NOT do LSO talkdown —
+/// that's a separate role and is explicitly out of scope.
 public sealed class AirbossResponseGenerator : IResponseGenerator
 {
     private static readonly Random Rng = new();
@@ -21,23 +18,26 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
         "two", "three", "four", "five", "six", "seven", "eight",
     };
 
-    private readonly string _shortName;
     private readonly IDcsClient _dcs;
-    private readonly Carrier _carrier;
-    private string _lastResponse = "";
+    private readonly ConcurrentDictionary<string, Carrier> _carriers;
+    private readonly ConcurrentDictionary<string, string> _lastResponses =
+        new(StringComparer.OrdinalIgnoreCase);
 
-    public AirbossResponseGenerator(IDcsClient dcs, Carrier carrier)
+    /// Used only by AvailableNext for the example phrasings.
+    private readonly string _exampleRecipient;
+
+    /// `carriers` is mutable and shared with the RoleManager — entries are
+    /// added/removed as DCS units appear and despawn. The generator just
+    /// reads from it at call time.
+    public AirbossResponseGenerator(
+        IDcsClient dcs,
+        ConcurrentDictionary<string, Carrier> carriers,
+        string exampleRecipient = "Boss")
     {
-        _shortName = carrier.AirbossCallsign;
         _dcs = dcs;
-        _carrier = carrier;
+        _carriers = carriers;
+        _exampleRecipient = exampleRecipient;
     }
-
-    /// Resolves the caller's live position via gRPC, or returns null when DCS
-    /// isn't connected / the player isn't tracked. Generators use the null
-    /// case to degrade to generic responses.
-    private AircraftSnapshot? PlayerFor(RadioCall call)
-        => call.Caller is null ? null : _dcs.PlayerByCallsign(call.Caller);
 
     public string Respond(RadioCall call)
     {
@@ -52,11 +52,11 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
             Intent.AirbossOffWire => OffWire(call),
             Intent.AirbossSayAgain => SayAgain(call),
             Intent.Unrecognized => Unrecognized(call),
-            _ => $"{call.Caller}, {_shortName}, unable.",
+            _ => $"{call.Caller}, {call.Recipient}, unable.",
         };
 
         if (call.Intent != Intent.AirbossSayAgain)
-            _lastResponse = response;
+            _lastResponses[call.Recipient] = response;
         return response;
     }
 
@@ -65,109 +65,111 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
         var caller = "Hornet 1-1";
         return new[]
         {
-            new NextStep("ready cats",     $"{_shortName}, {caller}, ready cats"),
-            new NextStep("inbound",        $"{_shortName}, {caller}, ten miles inbound"),
-            new NextStep("ready to push",  $"{_shortName}, {caller}, ready to push"),
-            new NextStep("in the break",   $"{_shortName}, {caller}, in the break"),
-            new NextStep("abeam",          $"{_shortName}, {caller}, abeam"),
-            new NextStep("ball",           $"{_shortName}, {caller}, see you at the ball"),
-            new NextStep("off the wire",   $"{_shortName}, {caller}, off the wire"),
-            new NextStep("say again",      $"{_shortName}, {caller}, say again"),
+            new NextStep("ready cats",     $"{_exampleRecipient}, {caller}, ready cats"),
+            new NextStep("inbound",        $"{_exampleRecipient}, {caller}, ten miles inbound"),
+            new NextStep("ready to push",  $"{_exampleRecipient}, {caller}, ready to push"),
+            new NextStep("in the break",   $"{_exampleRecipient}, {caller}, in the break"),
+            new NextStep("abeam",          $"{_exampleRecipient}, {caller}, abeam"),
+            new NextStep("ball",           $"{_exampleRecipient}, {caller}, see you at the ball"),
+            new NextStep("off the wire",   $"{_exampleRecipient}, {caller}, off the wire"),
+            new NextStep("say again",      $"{_exampleRecipient}, {caller}, say again"),
         };
     }
 
+    private Carrier? CarrierFor(string recipient)
+        => _carriers.TryGetValue(recipient, out var c) ? c : null;
+
+    private AircraftSnapshot? PlayerFor(RadioCall call)
+        => call.Caller is null ? null : _dcs.PlayerByCallsign(call.Caller);
+
+    // --- Handlers ---------------------------------------------------------
+
     private string ReadyForLaunch(RadioCall call)
     {
-        // ~20% chance the deck is fouled — adds variability to the flow.
         if (Rng.NextDouble() < 0.20)
-            return $"{call.Caller}, {_shortName}, deck fouled, hold position.";
+            return $"{call.Caller}, {call.Recipient}, deck fouled, hold position.";
 
         var cat = CatNumbers[Rng.Next(CatNumbers.Length)];
-        return $"{call.Caller}, {_shortName}, taxi to cat {cat}, stand by for launch.";
+        return $"{call.Caller}, {call.Recipient}, taxi to cat {cat}, stand by for launch.";
     }
 
-    /// Case I 10-mile inbound. Boss assigns a holding altitude in the overhead
-    /// stack (angels 2 is the bottom of the stack; higher arrivals stack above
-    /// in 1000ft increments). Pilot orbits there until Boss clears them to
-    /// commence the descent for the break.
     private string Inbound(RadioCall call)
     {
-        var holdAngels = Rng.Next(2, 5); // 2, 3, or 4 thousand feet
+        var carrier = CarrierFor(call.Recipient);
+        var holdAngels = Rng.Next(2, 5);
+
+        if (carrier is null || !_dcs.HasFreshData)
+        {
+            return $"{call.Caller}, {call.Recipient}, signal Charlie, " +
+                   $"hold overhead, angels {BrevityFormat.Digits(holdAngels)}. " +
+                   $"Stand by for commence.";
+        }
 
         var player = PlayerFor(call);
         if (player is null)
         {
-            return $"{call.Caller}, {_shortName}, signal Charlie, " +
+            return $"{call.Caller}, {call.Recipient}, signal Charlie, " +
                    $"hold overhead, angels {BrevityFormat.Digits(holdAngels)}. " +
-                   $"BRC {BrevityFormat.Digits(_carrier.BrcDeg, padding: 3)}. " +
+                   $"BRC {BrevityFormat.Digits(carrier.BrcDeg, padding: 3)}. " +
                    $"Stand by for commence.";
         }
 
-        var distNm = Geo.DistanceNm(player.Lat, player.Lon, _carrier.Lat, _carrier.Lon);
-
-        // Sanity check: if pilot says "inbound" but they're way out, push back.
+        var distNm = Geo.DistanceNm(player.Lat, player.Lon, carrier.Lat, carrier.Lon);
         if (distNm > 30)
         {
-            var bearingFromShip = Geo.BearingDeg(_carrier.Lat, _carrier.Lon, player.Lat, player.Lon);
+            var bearingFromShip = Geo.BearingDeg(carrier.Lat, carrier.Lon, player.Lat, player.Lon);
             var dir = Geo.CompassFromBearing(bearingFromShip);
-            return $"{call.Caller}, {_shortName}, no contact. " +
+            return $"{call.Caller}, {call.Recipient}, no contact. " +
                    $"Show you {BrevityFormat.Digits((int)Math.Round(distNm))} miles {dir}. " +
                    $"Steer for mom.";
         }
 
-        return $"{call.Caller}, {_shortName}, signal Charlie, " +
+        return $"{call.Caller}, {call.Recipient}, signal Charlie, " +
                $"hold overhead, angels {BrevityFormat.Digits(holdAngels)}. " +
-               $"BRC {BrevityFormat.Digits(_carrier.BrcDeg, padding: 3)}. " +
+               $"BRC {BrevityFormat.Digits(carrier.BrcDeg, padding: 3)}. " +
                $"Stand by for commence.";
     }
 
-    /// Pilot's "ready to push" / "ready to commence" — clears them down from
-    /// the overhead stack to break altitude (800ft) and assigns the break number.
     private string Commence(RadioCall call)
     {
-        var nForBreak = Rng.Next(1, 4); // "number 1/2/3 for the break"
+        var nForBreak = Rng.Next(1, 4);
         var breakNumberCall = nForBreak == 1
             ? "number one for the break"
             : $"number {BrevityFormat.Digits(nForBreak)} for the break";
 
-        return $"{call.Caller}, {_shortName}, cleared to push. " +
+        var carrier = CarrierFor(call.Recipient);
+        var brc = carrier?.BrcDeg ?? 180;
+
+        return $"{call.Caller}, {call.Recipient}, cleared to push. " +
                $"Descend pattern altitude, eight, zero, zero feet. " +
                $"{breakNumberCall}, three, five, zero knots. " +
+               $"BRC {BrevityFormat.Digits(brc, padding: 3)}. " +
                $"Report in the break.";
     }
 
-    /// Pilot has rolled in over the bow into downwind. Boss confirms entry and
-    /// reads the downwind pattern altitude + gear/flap reminder.
     private string InTheBreak(RadioCall call)
     {
         var altCheck = "";
         var player = PlayerFor(call);
-        if (player is not null)
+        if (player is not null && (player.AltFt < 400 || player.AltFt > 1500))
         {
-            // Initial break should be at ~800ft. Anything wildly off, flag it.
-            if (player.AltFt < 400 || player.AltFt > 1500)
-            {
-                altCheck = $" Check altitude — show you " +
-                           $"{BrevityFormat.Digits((int)Math.Round(player.AltFt))} feet.";
-            }
+            altCheck = $" Check altitude — show you " +
+                       $"{BrevityFormat.Digits((int)Math.Round(player.AltFt))} feet.";
         }
 
-        return $"{call.Caller}, {_shortName}, roger your break. " +
+        return $"{call.Caller}, {call.Recipient}, roger your break. " +
                $"Downwind 600 feet, dirty up, gear and flaps.{altCheck}";
     }
 
-    /// Abeam the LSO platform on downwind. Pattern altitude should be ~600ft,
-    /// configured for landing. Boss acknowledges; turn to base comes next.
     private string Abeam(RadioCall call)
     {
         var player = PlayerFor(call);
         if (player is null)
             return $"Roger, {ShortCaller(call)}, continue.";
 
-        // Pattern altitude is ~600 ft AGL. Anything outside 400-900 is wrong.
         if (player.AltFt < 400 || player.AltFt > 900)
         {
-            return $"{call.Caller}, {_shortName}, you're " +
+            return $"{call.Caller}, {call.Recipient}, you're " +
                    $"{BrevityFormat.Digits((int)Math.Round(player.AltFt))} feet. " +
                    $"Pattern altitude is 600. Correct your altitude.";
         }
@@ -177,31 +179,28 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
 
     private string Ball(RadioCall call)
     {
+        var carrier = CarrierFor(call.Recipient);
         var player = PlayerFor(call);
-        if (player is null)
+
+        if (carrier is null || player is null)
             return $"Roger ball, {ShortCaller(call)}.";
 
-        var distNm = Geo.DistanceNm(player.Lat, player.Lon, _carrier.Lat, _carrier.Lon);
-        var altAgl = player.AltFt;  // ship is ~60ft above water, close enough to MSL
+        var distNm = Geo.DistanceNm(player.Lat, player.Lon, carrier.Lat, carrier.Lon);
+        var altAgl = player.AltFt;
 
-        // "Ball" call is at ~3/4 mile, ~370 ft. Anything wildly off, push back.
         if (distNm > 2 || altAgl > 1500)
         {
-            return $"{call.Caller}, {_shortName}, negative ball. " +
+            return $"{call.Caller}, {call.Recipient}, negative ball. " +
                    $"Show you {BrevityFormat.Digits((int)Math.Round(distNm))} miles, " +
                    $"{BrevityFormat.Digits((int)Math.Round(altAgl))} feet. Continue approach.";
         }
 
-        // Real flow would hand off to LSO here ("paddles contact"). We don't have
-        // an LSO, so the airboss just clears the trap and stays out of the way.
         return $"Roger ball, {ShortCaller(call)}. Deck is clear.";
     }
 
     private string OffWire(RadioCall call)
     {
         var spot = DeckSpots[Rng.Next(DeckSpots.Length)];
-        // Real carriers have 4 arresting wires. 3-wire is target; 1 and 4 are
-        // off-target. Random for variety.
         var wire = Rng.Next(1, 5);
         var wireWord = wire switch
         {
@@ -210,25 +209,25 @@ public sealed class AirbossResponseGenerator : IResponseGenerator
             3 => "three wire",
             _ => "four wire",
         };
-        return $"{call.Caller}, {_shortName}, good trap, {wireWord}. Taxi to spot {spot}.";
+        return $"{call.Caller}, {call.Recipient}, good trap, {wireWord}. Taxi to spot {spot}.";
     }
 
     private string SayAgain(RadioCall call)
-        => string.IsNullOrEmpty(_lastResponse)
-           ? $"{call.Caller}, {_shortName}, no prior transmission to repeat."
-           : _lastResponse;
+    {
+        if (_lastResponses.TryGetValue(call.Recipient, out var last) && !string.IsNullOrEmpty(last))
+            return last;
+        return $"{call.Caller}, {call.Recipient}, no prior transmission to repeat.";
+    }
 
     private string Unrecognized(RadioCall call)
     {
         if (call.Caller is null)
-            return $"Unknown station calling {_shortName}, say again your callsign.";
+            return $"Unknown station calling {call.Recipient}, say again your callsign.";
 
         var options = string.Join(", ", AvailableNext().Select(s => s.Hint));
-        return $"{call.Caller}, {_shortName}, did not copy. Possible calls: {options}.";
+        return $"{call.Caller}, {call.Recipient}, did not copy. Possible calls: {options}.";
     }
 
-    /// Just the squadron name ("Hornet") without flight number — the airboss
-    /// uses the short form once contact is established, e.g. "Roger ball, Hornet".
     private static string ShortCaller(RadioCall call)
     {
         if (call.Caller is null) return "flight";

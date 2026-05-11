@@ -34,6 +34,10 @@ public sealed class RadioPipeline : IDisposable
     private readonly ITranscriber _transcriber;
     private readonly AgentRouter _router;
     private readonly IAudioOutput _output;
+    // Each RadioAgent carries its own AudioLock. We use the agent's lock here
+    // so the same agent never talks over itself (e.g. when a scheduled "merged"
+    // call hits while an existing transmission is mid-flight) — but different
+    // agents stay independent: they're on different radio frequencies.
 
     public RadioPipeline(
         IAudioInput input,
@@ -48,6 +52,35 @@ public sealed class RadioPipeline : IDisposable
     }
 
     public void StartCapture() => _input.Start();
+
+    /// Proactive (scheduler-driven) transmission. Synthesizes the message
+    /// through the agent's TTS and plays through the same audio output the
+    /// PTT pipeline uses, gated by the same audio lock. So if the JTAC is
+    /// mid-9-line and the AWACS wants to call "merged", the merge call waits
+    /// for the JTAC's transmission to finish before stepping on it.
+    public async Task SpeakAsync(RadioAgent agent, string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return;
+
+        var sentences = SplitForStreaming(message);
+        var currentWav = await agent.Tts.SynthesizeAsync(sentences[0]);
+
+        await agent.AudioLock.WaitAsync();
+        try
+        {
+            for (int i = 1; i < sentences.Count; i++)
+            {
+                var nextSynth = agent.Tts.SynthesizeAsync(sentences[i]);
+                await _output.PlayAsync(currentWav);
+                currentWav = await nextSynth;
+            }
+            await _output.PlayAsync(currentWav);
+        }
+        finally
+        {
+            agent.AudioLock.Release();
+        }
+    }
 
     public async Task<TransmissionResult> EndCaptureAsync()
     {
@@ -78,14 +111,25 @@ public sealed class RadioPipeline : IDisposable
         var currentWav = await agent.Tts.SynthesizeAsync(sentences[0]);
         var firstSynthTime = firstSynthSw.Elapsed;
 
+        // Per-agent lock: keeps the same agent from talking over itself if a
+        // scheduled call for that agent fires mid-transmission. Other agents
+        // are on their own frequencies and not blocked.
         var playbackSw = Stopwatch.StartNew();
-        for (int i = 1; i < sentences.Count; i++)
+        await agent.AudioLock.WaitAsync();
+        try
         {
-            var nextSynth = agent.Tts.SynthesizeAsync(sentences[i]);
+            for (int i = 1; i < sentences.Count; i++)
+            {
+                var nextSynth = agent.Tts.SynthesizeAsync(sentences[i]);
+                await _output.PlayAsync(currentWav);
+                currentWav = await nextSynth;
+            }
             await _output.PlayAsync(currentWav);
-            currentWav = await nextSynth;
         }
-        await _output.PlayAsync(currentWav);
+        finally
+        {
+            agent.AudioLock.Release();
+        }
 
         var totalSynthTime = totalSynthSw.Elapsed;
         var playbackTime = playbackSw.Elapsed;

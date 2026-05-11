@@ -8,6 +8,12 @@ public sealed class RadioAgent : IDisposable
     public IResponseGenerator Responder { get; }
     public ITextToSpeech Tts { get; }
 
+    /// Per-agent audio lock. Guards against the same agent talking over itself
+    /// when multiple watches fire concurrently. Different agents run on
+    /// different radio frequencies in the model — they don't share a lock,
+    /// so AWACS and JTAC can transmit in parallel.
+    public SemaphoreSlim AudioLock { get; } = new(1, 1);
+
     public RadioAgent(
         string role,
         string callsign,
@@ -22,5 +28,9 @@ public sealed class RadioAgent : IDisposable
         Tts = tts;
     }
 
-    public void Dispose() => Tts.Dispose();
+    public void Dispose()
+    {
+        Tts.Dispose();
+        AudioLock.Dispose();
+    }
 }

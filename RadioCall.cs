@@ -3,6 +3,8 @@ namespace RadioMan;
 public enum Intent
 {
     // AWACS
+    AwacsCheckIn,
+    AwacsCheckOut,
     AwacsPicture,
     AwacsBogeyDope,
     AwacsDeclare,

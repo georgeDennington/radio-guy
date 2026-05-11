@@ -1,7 +1,9 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using RadioMan;
 using RadioMan.Agents;
 using RadioMan.Audio;
+using RadioMan.Conditions;
 using RadioMan.Dcs;
 using RadioMan.Parsing;
 using RadioMan.Responses;
@@ -11,9 +13,11 @@ using RadioMan.Tts;
 const int VK_SPACE = 0x20;
 const int VK_ESCAPE = 0x1B;
 
-const string AwacsCallsign = "Wizard 1-1";
-const string JtacCallsign = "Hammer 1-1";
-const string AirbossCallsign = "Boss";
+// Static defaults — used if DCS isn't connected or has no matching units.
+// RoleManager discovers more at runtime and unions with these.
+string[] DefaultAwacsCallsigns = { "Wizard", "Magic" };
+string[] DefaultJtacCallsigns = { "Hammer" };
+string[] DefaultAirbossCallsigns = { "Boss" };
 
 if (args.Contains("--list-kokoro-voices"))
 {
@@ -58,35 +62,77 @@ IDcsClient dcs = args.Contains("--offline")
     : new DcsGrpcClient();
 using var _dcsDispose = dcs;
 
+// Pilots who've checked in with AWACS. AWACS proactive calls (merge, splash,
+// threat) only fire for callsigns in this roster. The AWACS response generator
+// adds/removes entries via the check-in / check-out intents.
+var awacsRoster = new AwacsRoster();
+
+// Shared carrier map — keyed by airboss recipient callsign, populated by
+// RoleManager from DCS. Pre-seeded with Roosevelt so offline testing has a
+// carrier to address.
+var carriers = new ConcurrentDictionary<string, Carrier>(StringComparer.OrdinalIgnoreCase);
+carriers["Boss"] = Carriers.Roosevelt;
+
 Console.WriteLine("Setting up agents:");
+var awacsParser = new RegexIntentParser(DefaultAwacsCallsigns, IntentRulesets.Awacs);
 var awacs = new RadioAgent(
     role: "AWACS",
-    callsign: AwacsCallsign,
-    parser: new RegexIntentParser(AwacsCallsign, IntentRulesets.Awacs),
-    responder: new AwacsResponseGenerator(dcs, AwacsCallsign),
+    callsign: "AWACS",   // role-level label only — pilot uses any of the recipient callsigns
+    parser: awacsParser,
+    responder: new AwacsResponseGenerator(dcs, awacsRoster),
     tts: new KokoroTts(sharedKokoro, awacsVoice, speed: 1.0f));
 
+var jtacParser = new RegexIntentParser(DefaultJtacCallsigns, IntentRulesets.Jtac);
 var jtac = new RadioAgent(
     role: "JTAC",
-    callsign: JtacCallsign,
-    parser: new RegexIntentParser(JtacCallsign, IntentRulesets.Jtac),
-    responder: new JtacResponseGenerator(JtacCallsign),
+    callsign: "JTAC",
+    parser: jtacParser,
+    responder: new JtacResponseGenerator(),
     tts: new KokoroTts(sharedKokoro, jtacVoice, speed: 0.85f));
 
+var airbossParser = new RegexIntentParser(DefaultAirbossCallsigns, IntentRulesets.Airboss);
 var airboss = new RadioAgent(
     role: "AIRBOSS",
-    callsign: AirbossCallsign,
-    parser: new RegexIntentParser(AirbossCallsign, IntentRulesets.Airboss),
-    responder: new AirbossResponseGenerator(dcs, Carriers.Roosevelt),
+    callsign: "AIRBOSS",
+    parser: airbossParser,
+    responder: new AirbossResponseGenerator(dcs, carriers),
     tts: new KokoroTts(sharedKokoro, airbossVoice, speed: 1.0f));
 
 var agents = new[] { awacs, jtac, airboss };
+
+// RoleManager keeps the parser recipient sets in sync with what's actually
+// in DCS — discovers AWACS aircraft, JTAC ground units, carrier ships and
+// updates each parser's recognized recipients accordingly. Static defaults
+// above are always preserved.
+using var roleManager = new RoleManager(
+    dcs: dcs,
+    carriers: carriers,
+    awacsParser: awacsParser,
+    jtacParser: jtacParser,
+    airbossParser: airbossParser,
+    staticAwacs: DefaultAwacsCallsigns,
+    staticJtacs: DefaultJtacCallsigns,
+    staticAirbosses: DefaultAirbossCallsigns);
 
 using var pipeline = new RadioPipeline(
     input: new MicAudioInput(),
     transcriber: new WhisperTranscriber(modelPath),
     router: new AgentRouter(agents),
     output: new SpeakerAudioOutput());
+
+// Proactive-call scheduler. Watches register here and emit ScheduledCalls
+// when conditions fire (merges, splashes, etc.). Delivery goes through the
+// pipeline's SpeakAsync so it shares the audio lock with PTT responses.
+using var scheduler = new WatchScheduler(dcs, async call =>
+{
+    Console.WriteLine($"\n[sched] {call.Agent.Role}: {call.Message}");
+    await pipeline.SpeakAsync(call.Agent, call.Message);
+});
+
+// First proactive condition: AWACS calls "merged" when a friendly closes to
+// within 3 nm of a hostile — but only for pilots who've checked in.
+var mergeDetector = new MergeDetector(awacs, scheduler, awacsRoster);
+mergeDetector.Start();
 
 Console.WriteLine();
 Console.WriteLine("Active agents:");

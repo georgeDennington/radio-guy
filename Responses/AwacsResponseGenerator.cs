@@ -1,49 +1,82 @@
 using System.Text.RegularExpressions;
+using RadioMan.Conditions;
 using RadioMan.Dcs;
 
 namespace RadioMan.Responses;
 
 /// AWACS controller for the picture / bogey dope / declare brevity calls.
-/// Pulls real position data from IDcsClient when available; falls back to
-/// plausible random data so the system stays usable without DCS connected.
+/// One AWACS agent serves multiple AWACS units in DCS — the parser recognizes
+/// any configured callsign, and this generator uses `call.Recipient` to know
+/// which specific AWACS unit the pilot addressed.
+///
+/// Per-recipient state (the roster of checked-in pilots) lives in AwacsRoster
+/// keyed by recipient name.
 public sealed class AwacsResponseGenerator : IResponseGenerator
 {
     private static readonly Random Rng = new();
-    private readonly string _shortName;
-    private readonly IDcsClient _dcs;
 
-    public AwacsResponseGenerator(IDcsClient dcs, string callsign = "Wizard 1-1")
+    /// Used only for the AvailableNext example phrases. Real recipient names
+    /// come from `call.Recipient` at parse time.
+    private readonly string _exampleRecipient;
+
+    private readonly IDcsClient _dcs;
+    private readonly AwacsRoster _roster;
+
+    public AwacsResponseGenerator(IDcsClient dcs, AwacsRoster roster, string exampleRecipient = "Wizard")
     {
-        _shortName = callsign.Split(' ', 2)[0];
         _dcs = dcs;
+        _roster = roster;
+        _exampleRecipient = exampleRecipient;
     }
 
     public string Respond(RadioCall call) => call.Intent switch
     {
+        Intent.AwacsCheckIn => CheckIn(call),
+        Intent.AwacsCheckOut => CheckOut(call),
         Intent.AwacsPicture => Picture(call),
         Intent.AwacsBogeyDope => BogeyDope(call),
         Intent.AwacsDeclare => Declare(call),
         Intent.Unrecognized => Unrecognized(call),
-        _ => $"{call.Caller}, {_shortName}, unable.",
+        _ => $"{call.Caller}, {call.Recipient}, unable.",
     };
+
+    private string CheckIn(RadioCall call)
+    {
+        if (call.Caller is null)
+            return $"Unknown station calling {call.Recipient}, say again your callsign.";
+
+        _roster.CheckIn(call.Recipient, call.Caller);
+        return $"{call.Caller}, {call.Recipient}, radar contact, working.";
+    }
+
+    private string CheckOut(RadioCall call)
+    {
+        if (call.Caller is null)
+            return $"Unknown station calling {call.Recipient}, say again your callsign.";
+
+        _roster.CheckOut(call.Recipient, call.Caller);
+        return $"{call.Caller}, {call.Recipient}, copy off station, good day.";
+    }
 
     private string Unrecognized(RadioCall call)
     {
         if (call.Caller is null)
-            return $"Unknown station calling {_shortName}, say again your callsign.";
+            return $"Unknown station calling {call.Recipient}, say again your callsign.";
 
         var options = string.Join(", ", AvailableNext().Select(s => s.Hint));
-        return $"{call.Caller}, {_shortName}, did not copy. " +
+        return $"{call.Caller}, {call.Recipient}, did not copy. " +
                $"Possible calls: {options}.";
     }
 
     public IReadOnlyList<NextStep> AvailableNext() => new[]
     {
-        new NextStep("picture",         $"{_shortName}, Viper 2-1, request picture"),
-        new NextStep("bogey dope",      $"{_shortName}, Viper 2-1, bogey dope"),
-        new NextStep("declare bullseye", $"{_shortName}, Viper 2-1, declare bullseye 270 35"),
-        new NextStep("declare BRA",     $"{_shortName}, Viper 2-1, declare BRA 270 35"),
-        new NextStep("declare nose",    $"{_shortName}, Viper 2-1, declare on the nose 35"),
+        new NextStep("check in",         $"{_exampleRecipient}, Viper 2-1, checking in"),
+        new NextStep("picture",          $"{_exampleRecipient}, Viper 2-1, request picture"),
+        new NextStep("bogey dope",       $"{_exampleRecipient}, Viper 2-1, bogey dope"),
+        new NextStep("declare bullseye", $"{_exampleRecipient}, Viper 2-1, declare bullseye 270 35"),
+        new NextStep("declare BRA",      $"{_exampleRecipient}, Viper 2-1, declare BRA 270 35"),
+        new NextStep("declare nose",     $"{_exampleRecipient}, Viper 2-1, declare on the nose 35"),
+        new NextStep("check out",        $"{_exampleRecipient}, Viper 2-1, checking out"),
     };
 
     // --- Picture ----------------------------------------------------------
@@ -53,20 +86,17 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         var caller = call.Caller is null ? null : _dcs.PlayerByCallsign(call.Caller);
         var bullseye = caller is null ? null : _dcs.Bullseye(caller.Coalition);
 
-        // If we don't have either the caller's snapshot or their coalition's
-        // bullseye, degrade to a plausible random picture.
         if (caller is null || bullseye is null || !_dcs.HasFreshData)
             return PicturePlaceholder(call);
 
         var hostiles = Awacs.HostilesFor(_dcs.AllAircraft, caller.Coalition);
         if (hostiles.Count == 0)
-            return $"{call.Caller}, {_shortName}, picture clean.";
+            return $"{call.Caller}, {call.Recipient}, picture clean.";
 
         var groups = Awacs.GroupHostiles(hostiles);
 
-        // Build "Group 1 ... Group 2 ..." chunks.
         var parts = new List<string>();
-        for (int i = 0; i < groups.Count && i < 3; i++)  // cap at 3 groups for readability
+        for (int i = 0; i < groups.Count && i < 3; i++)
         {
             var g = groups[i];
             var (brg, range) = Geo.BullseyeRelative(bullseye.Lat, bullseye.Lon,
@@ -90,14 +120,14 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
             _ => $"{BrevityFormat.Digits(groups.Count)} groups",
         };
 
-        return $"{call.Caller}, {_shortName}, picture: {groupCount}. " +
+        return $"{call.Caller}, {call.Recipient}, picture: {groupCount}. " +
                string.Join(". ", parts) + ".";
     }
 
     private string PicturePlaceholder(RadioCall call)
     {
         if (Rng.NextDouble() < 0.15)
-            return $"{call.Caller}, {_shortName}, picture clean.";
+            return $"{call.Caller}, {call.Recipient}, picture clean.";
 
         int groups = Rng.Next(1, 4);
         var groupWord = groups == 1 ? "single group" : $"{Spell(groups)} groups";
@@ -105,7 +135,7 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         int range = Rng.Next(15, 80);
         int alt = Rng.Next(10, 40);
         var aspect = Rng.NextDouble() < 0.5 ? "hot" : "cold";
-        return $"{call.Caller}, {_shortName}, picture: {groupWord}, " +
+        return $"{call.Caller}, {call.Recipient}, picture: {groupWord}, " +
                $"bullseye {BrevityFormat.Digits(bra, padding: 3)} for " +
                $"{BrevityFormat.Digits(range)}, {BrevityFormat.Digits(alt)} thousand, " +
                $"{aspect}, hostile.";
@@ -123,7 +153,7 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
 
         var nearest = Awacs.NearestHostile(caller, _dcs.AllAircraft);
         if (nearest is null)
-            return $"{call.Caller}, {_shortName}, no contacts.";
+            return $"{call.Caller}, {call.Recipient}, no contacts.";
 
         var (brg, range) = Geo.BullseyeRelative(bullseye.Lat, bullseye.Lon,
                                                  nearest.Lat, nearest.Lon);
@@ -131,7 +161,7 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         var aspect = Geo.AspectFrom(nearest.Lat, nearest.Lon, nearest.HeadingDeg,
                                      caller.Lat, caller.Lon);
 
-        return $"{call.Caller}, {_shortName}, single contact, " +
+        return $"{call.Caller}, {call.Recipient}, single contact, " +
                $"bullseye {BrevityFormat.Digits((int)Math.Round(brg), padding: 3)} " +
                $"for {BrevityFormat.Digits((int)Math.Round(range))}, " +
                $"{BrevityFormat.Digits(altThousands)} thousand, " +
@@ -144,7 +174,7 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         int range = Rng.Next(10, 60);
         int alt = Rng.Next(8, 40);
         var aspect = Rng.NextDouble() < 0.5 ? "hot" : "flank";
-        return $"{call.Caller}, {_shortName}, bogey dope: " +
+        return $"{call.Caller}, {call.Recipient}, bogey dope: " +
                $"bullseye {BrevityFormat.Digits(bra, padding: 3)} for " +
                $"{BrevityFormat.Digits(range)}, {BrevityFormat.Digits(alt)} thousand, " +
                $"{aspect}, hostile.";
@@ -162,7 +192,6 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         if (form == DeclareForm.Unknown || !_dcs.HasFreshData || caller is null)
             return DeclarePlaceholder(call);
 
-        // For each form, compute the target lat/lon, then find the nearest contact.
         AircraftSnapshot? contact = null;
 
         if (form == DeclareForm.Bullseye)
@@ -174,35 +203,28 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         }
         else if (form == DeclareForm.Bra && bearing is not null && range is not null)
         {
-            // BRA: from caller's position, true bearing + range.
             var (tLat, tLon) = Geo.ProjectFrom(caller.Lat, caller.Lon, bearing.Value, range.Value);
             contact = Awacs.NearestAircraftNear(tLat, tLon, _dcs.AllAircraft);
         }
         else if (form == DeclareForm.Nose && range is not null)
         {
-            // On the nose: caller's heading is the bearing.
             var (tLat, tLon) = Geo.ProjectFrom(caller.Lat, caller.Lon, caller.HeadingDeg, range.Value);
             contact = Awacs.NearestAircraftNear(tLat, tLon, _dcs.AllAircraft);
         }
 
         if (contact is null)
-            return $"{call.Caller}, {_shortName}, declare: clean.";
+            return $"{call.Caller}, {call.Recipient}, declare: clean.";
 
         if (string.Equals(contact.Coalition, caller.Coalition, StringComparison.OrdinalIgnoreCase))
-            return $"{call.Caller}, {_shortName}, declare: friendly.";
+            return $"{call.Caller}, {call.Recipient}, declare: friendly.";
         if (string.Equals(contact.Coalition, "Neutral", StringComparison.OrdinalIgnoreCase))
-            return $"{call.Caller}, {_shortName}, declare: neutral, no IFF.";
+            return $"{call.Caller}, {call.Recipient}, declare: neutral, no IFF.";
 
-        return $"{call.Caller}, {_shortName}, declare: hostile, type {contact.AircraftType}.";
+        return $"{call.Caller}, {call.Recipient}, declare: hostile, type {contact.AircraftType}.";
     }
 
-    /// Parse the declare call. Three forms:
-    ///   bullseye  — "declare bullseye 270 35"        → bearing+range from bullseye
-    ///   bra       — "declare BRA 270 35"             → bearing+range from caller
-    ///   nose      — "declare on the nose 35" / "nose 35" → caller's heading, range nm
     private static (DeclareForm Form, int? Bearing, int? Range) ParseDeclare(string normalizedText)
     {
-        // Check for "on the nose" / "nose" cue first (most specific).
         var noseMatch = Regex.Match(normalizedText,
             @"\b(?:on\s+(?:the|my|your)\s+)?nose\b|\bboresight\b",
             RegexOptions.IgnoreCase);
@@ -213,7 +235,6 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
             return (DeclareForm.Nose, null, nums.Count >= 1 ? nums[0] : null);
         }
 
-        // BRA: "bra" as single word, or "b r a" as three single-letter tokens.
         var braMatch = Regex.Match(normalizedText,
             @"\bbra\b|\bb\s+r\s+a\b|\bbearing\b",
             RegexOptions.IgnoreCase);
@@ -226,7 +247,6 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
                     nums.Count >= 2 ? nums[1] : null);
         }
 
-        // Default: bullseye form. Anchor on the "declare" or "bullseye" keyword.
         var beMatch = Regex.Match(normalizedText,
             @"\b(?:bullseye|declare)\b",
             RegexOptions.IgnoreCase);
@@ -241,8 +261,6 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
         return (DeclareForm.Unknown, null, null);
     }
 
-    /// Extract up to `max` integers from text. Consecutive single-digit tokens
-    /// collapse into one number ("2 7 0" → 270); a multi-digit token stands alone.
     private static List<int> ExtractFirstNumbers(string text, int max)
     {
         var tokens = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -284,13 +302,13 @@ public sealed class AwacsResponseGenerator : IResponseGenerator
     private string DeclarePlaceholder(RadioCall call)
     {
         var roll = Rng.NextDouble();
-        if (roll < 0.10) return $"{call.Caller}, {_shortName}, declare: clean.";
-        if (roll < 0.25) return $"{call.Caller}, {_shortName}, declare: friendly.";
-        if (roll < 0.35) return $"{call.Caller}, {_shortName}, declare: unknown, no IFF.";
+        if (roll < 0.10) return $"{call.Caller}, {call.Recipient}, declare: clean.";
+        if (roll < 0.25) return $"{call.Caller}, {call.Recipient}, declare: friendly.";
+        if (roll < 0.35) return $"{call.Caller}, {call.Recipient}, declare: unknown, no IFF.";
 
         var types = new[] { "Su-27", "Su-30", "Su-35", "MiG-29", "MiG-31", "Su-24", "Su-25" };
         var type = types[Rng.Next(types.Length)];
-        return $"{call.Caller}, {_shortName}, declare: hostile, type {type}.";
+        return $"{call.Caller}, {call.Recipient}, declare: hostile, type {type}.";
     }
 
     private static string Spell(int n) => n switch
